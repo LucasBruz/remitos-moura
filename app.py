@@ -228,12 +228,10 @@ if procesar and uploaded_pdf:
         # Orden por sucursal y número (numérico)
         registros.sort(key=lambda x: tuple(map(int, x[0].split('-'))))
 
-        # Prefijo para mantener el orden dentro del ZIP
-        for idx, (rem, archivo) in enumerate(registros, 1):
-            ori = clasificados / archivo
-            nuevo = clasificados / f"{idx:06d}_{archivo}"
-            if ori.exists():
-                ori.rename(nuevo)
+       # Sin prefijo: dejamos los nombres tal cual (0034-00033477.pdf, etc.)
+# Si querés conservar un orden estable dentro del ZIP, el ZIP se construirá en base al orden del listado.
+# No renombramos con índice.
+pass
 
         # Armar ZIP con carpeta "Remitos Clasificados"
         zip_path = tmp_dir / "remitos_clasificados.zip"
