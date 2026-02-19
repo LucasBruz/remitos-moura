@@ -14,13 +14,35 @@ st.title("📦 Clasificador de Remitos - App Web (con OCR y anti-bloqueo)")
 st.write("Subí un PDF; la app separa, reconoce (texto directo o OCR por API), ordena y renombra los remitos, y devuelve un ZIP.")
 
 # === Control de OCR (antibloqueo) ===
-MAX_OCR = 20            # Máximo de páginas a enviar a OCR por ejecución (ajustable)
-SLEEP_BETWEEN_OCR = 1.0 # Pausa (segundos) entre llamadas OCR (ajustable)
+MAX_OCR = 20             # Máximo de páginas a enviar al OCR por ejecución (ajustable)
+SLEEP_BETWEEN_OCR = 1.0  # Pausa (segundos) entre llamadas OCR (ajustable)
+RATE_LIMIT_MAX = 170     # Tope horario para no llegar al límite de 180/h del proveedor (margen de seguridad)
 
 uploaded_pdf = st.file_uploader("📄 Subir PDF", type=["pdf"])
 patron = st.text_input("🔍 Patrón (regex) para detectar remitos", value=r"\b\d{4}-\d{8}\b")
 usar_ocr = st.checkbox("Usar OCR para páginas sin texto", value=True)
+start_page = st.number_input("Continuar desde página", min_value=1, value=1, step=1)
 procesar = st.button("🚀 Procesar PDF")
+
+# ===== Estado de ventana horaria para el rate limit =====
+if "window_start" not in st.session_state:
+    st.session_state.window_start = None
+if "ocr_calls" not in st.session_state:
+    st.session_state.ocr_calls = 0
+
+def _reset_window_if_needed():
+    now = time.time()
+    ws = st.session_state.window_start
+    if ws is None or (now - ws) >= 3600:
+        st.session_state.window_start = now
+        st.session_state.ocr_calls = 0
+
+def can_call_ocr():
+    _reset_window_if_needed()
+    return st.session_state.ocr_calls < RATE_LIMIT_MAX
+
+def register_ocr_call():
+    st.session_state.ocr_calls += 1
 
 # ===== Utilidades =====
 
@@ -93,7 +115,7 @@ def ocr_api_pdf_bytes(pdf_bytes: bytes, api_key: str, language="spa") -> str:
         try:
             r = requests.post(url, files=files, data=data, headers=headers, timeout=30)
             if r.status_code == 403:
-                # Mostrar detalle del server (ayuda a diagnosticar plan/clave)
+                # Mostrar detalle del server (ayuda a diagnosticar plan/clave/limit)
                 try:
                     st.warning(f"403 OCR: {r.json()}")
                 except Exception:
@@ -113,10 +135,14 @@ def ocr_api_pdf_bytes(pdf_bytes: bytes, api_key: str, language="spa") -> str:
             else:
                 raise
 
-# Mostrar si la API Key está cargada (diagnóstico)
+# Mostrar si la API Key está cargada (diagnóstico + contador horario)
 has_key = "OCRSPACE_API_KEY" in st.secrets and bool(st.secrets["OCRSPACE_API_KEY"])
-st.caption(f"🔐 API Key cargada: {'Sí' if has_key else 'No'}")
 api_key = st.secrets.get("OCRSPACE_API_KEY", None)
+_reset_window_if_needed()
+st.caption(
+    f"🔐 API Key cargada: {'Sí' if has_key else 'No'} • "
+    f"OCR en esta hora: {st.session_state.ocr_calls}/{RATE_LIMIT_MAX}"
+)
 
 # ===== Flujo principal =====
 
@@ -133,14 +159,17 @@ if procesar and uploaded_pdf:
         uploaded_pdf.seek(0)
         reader = PdfReader(uploaded_pdf)
         total = len(reader.pages)
+        start_idx = max(0, min(total - 1, start_page - 1))
+
         registros = []
 
         # Progreso visual
         progress = st.progress(0, text="Inicializando…")
         status = st.empty()
         ocr_count = 0  # páginas enviadas a OCR en esta ejecución
+        stopped_by_rate = False
 
-        for i in range(total):
+        for i in range(start_idx, total):
             status.text(f"Procesando página {i+1} de {total}…")
             progress.progress(int((i+1)/total*100))
 
@@ -148,8 +177,20 @@ if procesar and uploaded_pdf:
             texto = extraer_texto_por_pypdf2(reader, i)
             remito = detectar_por_texto(texto, patron)
 
-            # 2) Si no detecta, y hay API Key y se activó OCR y no pasamos el tope, usar OCR
+            # 2) OCR solo si:
+            #   - no se detectó por texto
+            #   - el checkbox está activo
+            #   - existe API Key
+            #   - no superamos MAX_OCR
+            #   - y estamos debajo del RATE_LIMIT_MAX horario
             if (not remito) and usar_ocr and api_key and (ocr_count < MAX_OCR):
+                if not can_call_ocr():
+                    faltan = 3600 - int(time.time() - st.session_state.window_start)
+                    st.info(f"⏳ Llegaste al cupo horario de OCR ({RATE_LIMIT_MAX}/h). "
+                            f"Volvé a ejecutar en ~{max(1, faltan)} segundos o más.")
+                    stopped_by_rate = True
+                    break
+
                 # Generar PDF de 1 página en memoria
                 buf = io.BytesIO()
                 w = PdfWriter()
@@ -163,7 +204,8 @@ if procesar and uploaded_pdf:
                 except Exception as e:
                     st.warning(f"⚠️ OCR falló en la página {i+1}: {e}")
 
-                # Contamos el OCR y pausamos
+                # Registrar llamada y pausar
+                register_ocr_call()
                 ocr_count += 1
                 time.sleep(SLEEP_BETWEEN_OCR)
 
@@ -177,7 +219,7 @@ if procesar and uploaded_pdf:
             else:
                 sufijo = ""
                 if (not remito) and usar_ocr and api_key and (ocr_count >= MAX_OCR):
-                    sufijo = "_TOPE_OCR"  # para identificar las páginas que no pasaron por OCR por el tope
+                    sufijo = "_TOPE_OCR"
                 nombre = f"SIN_REMITO_{i+1}{sufijo}.pdf"
 
             with open(clasificados / nombre, "wb") as f:
@@ -210,7 +252,18 @@ if procesar and uploaded_pdf:
                 mime="application/zip",
             )
 
+        # Mensajes de cierre
+        if stopped_by_rate:
+            st.info("👆 Se detuvo por el límite horario de OCR. "
+                    "Usá “Continuar desde página” para retomar luego donde quedó.")
+        elif usar_ocr and api_key and (ocr_count >= MAX_OCR):
+            st.info("🔁 Alcanzaste el tope de páginas OCR por esta ejecución. "
+                    "Aumentá MAX_OCR o re-ejecutá con 'Continuar desde página' para seguir.")
+        else:
+            st.caption("Listo. Si quedaron páginas SIN_REMITO, reintentá con OCR activado o ajustá el patrón.")
+
 st.caption(
-    f"Nota: OCR por API activo: {'Sí' if (usar_ocr and has_key) else 'No'}. "
-    f"Límite OCR por ejecución: {MAX_OCR} • Pausa entre llamadas: {SLEEP_BETWEEN_OCR}s"
+    f"Nota: OCR por API: {'Sí' if (usar_ocr and has_key) else 'No'} • "
+    f"Límite OCR ejecución: {MAX_OCR} • Pausa: {SLEEP_BETWEEN_OCR}s • "
+    f"Cupo horario usado: {st.session_state.ocr_calls}/{RATE_LIMIT_MAX}"
 )
