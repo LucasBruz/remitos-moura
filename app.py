@@ -5,28 +5,19 @@ import re
 import os
 from pathlib import Path
 import shutil
-
-# OCR y rasterizado
-import easyocr
-import numpy as np
-import pypdfium2 as pdfium
-from PIL import Image
+import io
+import requests
+import time
 
 st.set_page_config(page_title="Clasificador de Remitos", page_icon="📦", layout="centered")
-st.title("📦 Clasificador de Remitos - App Web (con OCR)")
-st.write("Subí un PDF; la app separa, reconoce (texto o imagen vía OCR), ordena y renombra los remitos, y devuelve un ZIP.")
+st.title("📦 Clasificador de Remitos - App Web (con OCR por API)")
+st.write("Subí un PDF; la app separa, reconoce (texto directo o por OCR en la nube), ordena y renombra los remitos, y devuelve un ZIP.")
 
 uploaded_pdf = st.file_uploader("📄 Subir PDF", type=["pdf"])
 patron = st.text_input("🔍 Patrón (regex) para detectar remitos", value=r"\b\d{4}-\d{8}\b")
 procesar = st.button("🚀 Procesar PDF")
 
-# ========= Utilities =========
-
-@st.cache_resource
-def get_ocr_reader():
-    # Idiomas más típicos: español e inglés (agregá otros si te hace falta, ej. 'pt').
-    return easyocr.Reader(['es', 'en'], gpu=False)
-
+# ===== Utils =====
 def normalizar_remito(remito: str):
     s = re.sub(r"[^0-9-]", "", remito)
     if "-" in s:
@@ -44,7 +35,6 @@ def normalizar_remito(remito: str):
     return f"{suc}-{num}"
 
 def detectar_por_texto(texto: str, patron_rx: str):
-    # 1) patrón del usuario
     if patron_rx:
         try:
             m = re.search(patron_rx, texto)
@@ -55,13 +45,11 @@ def detectar_por_texto(texto: str, patron_rx: str):
                     return norm
         except Exception:
             pass
-    # 2) heurística: bloque de 10 a 14 dígitos (sin guión)
     m2 = re.search(r"\b(\d{10,14})\b", texto)
     if m2:
         norm = normalizar_remito(m2.group(1))
         if norm:
             return norm
-    # 3) fallback: dos grupos separados por no dígito
     m3 = re.search(r"(\d{1,4})\D+(\d{5,10})", texto)
     if m3:
         norm = normalizar_remito(f"{m3.group(1)}-{m3.group(2)}")
@@ -69,39 +57,44 @@ def detectar_por_texto(texto: str, patron_rx: str):
             return norm
     return None
 
-def render_pagina_a_imagen(reader: pdfium.PdfDocument, index: int, scale: float = 2.0) -> Image.Image:
-    # Render a imagen con pdfium (sin dependencias del sistema).
-    page = reader.get_page(index)
-    bitmap = page.render(scale=scale).to_pil()
-    page.close()
-    return bitmap.convert("RGB")
-
-def ocr_imagen(img: Image.Image) -> str:
-    # EasyOCR devuelve lista de [bbox, text, confidence]
-    # Unimos todos los textos en un string.
-    reader = get_ocr_reader()
-    arr = np.array(img)
-    results = reader.readtext(arr, detail=1, paragraph=True)
-    textos = []
-    for _, texto, conf in results:
-        if conf is None or conf < 0.2:
-            # Filtrar ruido muy bajo
-            continue
-        textos.append(texto)
-    return "\n".join(textos)
-
-def extraer_texto_por_pypdf2(pdfreader: PdfReader, idx: int) -> str:
+def extraer_texto_por_pypdf2(reader: PdfReader, idx: int) -> str:
     try:
-        page = pdfreader.pages[idx]
+        page = reader.pages[idx]
         t = page.extract_text()
         return t or ""
     except Exception:
         return ""
 
-# ========= Flujo principal =========
+def ocr_api_pdf_bytes(pdf_bytes: bytes, api_key: str, language="spa") -> str:
+    """
+    Envía un PDF (1 página) a un OCR en la nube y devuelve el texto plano.
+    Usa OCR.space como ejemplo (requiere API key).
+    """
+    url = "https://api.ocr.space/parse/image"
+    files = {"file": ("page.pdf", pdf_bytes, "application/pdf")}
+    data = {
+        "language": language,
+        "isOverlayRequired": False,
+        "OCREngine": 2,
+        "scale": True
+    }
+    headers = {"apikey": api_key}
+    r = requests.post(url, files=files, data=data, headers=headers, timeout=120)
+    r.raise_for_status()
+    js = r.json()
+    if js.get("IsErroredOnProcessing"):
+        raise RuntimeError(js.get("ErrorMessage") or "OCR error")
+    results = js.get("ParsedResults", [])
+    if not results:
+        return ""
+    return results[0].get("ParsedText", "") or ""
 
+# ===== Main =====
 if procesar and uploaded_pdf:
-    with st.spinner("Procesando PDF… (esto puede tardar si hay OCR)"):
+    # Tomamos la API key desde los secrets (Streamlit Cloud > Settings > Secrets)
+    api_key = st.secrets.get("OCRSPACE_API_KEY", None)
+
+    with st.spinner("Procesando PDF…"):
         tmp_dir = Path("remitos_tmp")
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
@@ -110,33 +103,34 @@ if procesar and uploaded_pdf:
         clasificados = tmp_dir / "Remitos Clasificados"
         clasificados.mkdir()
 
-        reader = PdfReader(uploaded_pdf)
-        total_pag = len(reader.pages)
-        registros = []
-
-        # Abrimos el PDF con pypdfium2 para rasterizar cuando haga falta
-        uploaded_pdf.seek(0)  # reset pointer para pdfium
-        pdfium_doc = pdfium.PdfDocument(uploaded_pdf.read())
-        # (Volvemos a abrir PyPDF2 después de leer en pdfium)
         uploaded_pdf.seek(0)
         reader = PdfReader(uploaded_pdf)
+        total = len(reader.pages)
+        registros = []
 
-        for i in range(total_pag):
+        for i in range(total):
             # 1) Intento texto directo
             texto = extraer_texto_por_pypdf2(reader, i)
             remito = detectar_por_texto(texto, patron)
 
-            # 2) Si no lo encontré, intento OCR
-            if not remito:
+            # 2) Si no detecta y hay API key, intento OCR por API
+            if not remito and api_key:
+                # Genero un PDF de 1 página en memoria
+                buf = io.BytesIO()
+                w = PdfWriter()
+                w.add_page(reader.pages[i])
+                w.write(buf)
+                buf.seek(0)
+
                 try:
-                    img = render_pagina_a_imagen(pdfium_doc, i, scale=2.0)
-                    texto_ocr = ocr_imagen(img)
+                    texto_ocr = ocr_api_pdf_bytes(buf.read(), api_key, language="spa")
                     remito = detectar_por_texto(texto_ocr, patron)
+                    # Pequeña pausa para evitar rate-limit en planes gratuitos
+                    time.sleep(1.0)
                 except Exception as e:
-                    # Si algo falla en OCR, continuamos sin detener todo el proceso
                     st.warning(f"⚠️ OCR falló en la página {i+1}: {e}")
 
-            # 3) Guardar página individual (siempre)
+            # 3) Guardar la página individual siempre
             writer = PdfWriter()
             writer.add_page(reader.pages[i])
 
@@ -152,14 +146,14 @@ if procesar and uploaded_pdf:
         # Orden por sucursal y número
         registros.sort(key=lambda x: tuple(map(int, x[0].split('-'))))
 
-        # Prefijo para mantener orden dentro del ZIP
+        # Prefijo para mantener orden en ZIP
         for idx, (rem, archivo) in enumerate(registros, 1):
             ori = clasificados / archivo
             nuevo = clasificados / f"{idx:06d}_{archivo}"
             if ori.exists():
                 ori.rename(nuevo)
 
-        # Armar ZIP con carpeta "Remitos Clasificados"
+        # Armar ZIP
         zip_path = tmp_dir / "remitos_clasificados.zip"
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
             for rootp, _, files in os.walk(clasificados):
@@ -176,4 +170,5 @@ if procesar and uploaded_pdf:
                 mime="application/zip",
             )
 
-st.caption("Nota: ahora la app usa OCR automáticamente cuando no encuentra texto (PDFs escaneados).")
+nota = "Nota: si no configurás la API key, la app igualmente funciona con texto embebido; el OCR en la nube se activará sólo si hay API key."
+st.caption(nota)
