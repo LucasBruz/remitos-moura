@@ -8,6 +8,7 @@ import shutil
 import io
 import time
 import requests
+from datetime import datetime
 
 st.set_page_config(page_title="Clasificador de Remitos", page_icon="📦", layout="centered")
 st.title("📦 Clasificador de Remitos - App Web (con OCR y anti-bloqueo)")
@@ -16,7 +17,7 @@ st.write("Subí un PDF; la app separa, reconoce (texto directo o OCR por API), o
 # === Control de OCR (antibloqueo) ===
 MAX_OCR = 20             # Máximo de páginas a enviar al OCR por ejecución (ajustable)
 SLEEP_BETWEEN_OCR = 1.0  # Pausa (segundos) entre llamadas OCR (ajustable)
-RATE_LIMIT_MAX = 170     # Tope horario para no llegar al límite de 180/h del proveedor (margen de seguridad)
+RATE_LIMIT_MAX = 170     # Tope horario para no llegar al límite de ~180/h del proveedor (margen de seguridad)
 
 uploaded_pdf = st.file_uploader("📄 Subir PDF", type=["pdf"])
 patron = st.text_input("🔍 Patrón (regex) para detectar remitos", value=r"\b\d{4}-\d{8}\b")
@@ -186,8 +187,11 @@ if procesar and uploaded_pdf:
             if (not remito) and usar_ocr and api_key and (ocr_count < MAX_OCR):
                 if not can_call_ocr():
                     faltan = 3600 - int(time.time() - st.session_state.window_start)
-                    st.info(f"⏳ Llegaste al cupo horario de OCR ({RATE_LIMIT_MAX}/h). "
-                            f"Volvé a ejecutar en ~{max(1, faltan)} segundos o más.")
+                    st.info(
+                        "⏳ Llegaste al cupo horario de OCR. "
+                        f"Volvé a ejecutar en ~{max(1, faltan)} s. "
+                        "Usá “Continuar desde página” para retomar."
+                    )
                     stopped_by_rate = True
                     break
 
@@ -219,7 +223,7 @@ if procesar and uploaded_pdf:
             else:
                 sufijo = ""
                 if (not remito) and usar_ocr and api_key and (ocr_count >= MAX_OCR):
-                    sufijo = "_TOPE_OCR"
+                    sufijo = "_TOPE_OCR"  # identifica páginas no pasadas por OCR por tope
                 nombre = f"SIN_REMITO_{i+1}{sufijo}.pdf"
 
             with open(clasificados / nombre, "wb") as f:
@@ -228,35 +232,53 @@ if procesar and uploaded_pdf:
         # Orden por sucursal y número (numérico)
         registros.sort(key=lambda x: tuple(map(int, x[0].split('-'))))
 
-       # Sin prefijo: dejamos los nombres tal cual (0034-00033477.pdf, etc.)
-# Si querés conservar un orden estable dentro del ZIP, el ZIP se construirá en base al orden del listado.
-# No renombramos con índice.
-pass
+        # ==== Construir ZIP con nombre Moura_Remitos_YYYY-MM-DD.zip ====
+        fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+        zip_name = f"Moura_Remitos_{fecha_hoy}.zip"
+        zip_path = tmp_dir / zip_name
 
-        # Armar ZIP con carpeta "Remitos Clasificados"
-        zip_path = tmp_dir / "remitos_clasificados.zip"
+        # Agregar al ZIP respetando:
+        # 1) detectados en orden (registros)
+        # 2) luego SIN_REMITO (orden alfabético)
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
-            for rootp, _, files in os.walk(clasificados):
-                for f in files:
-                    abs_path = Path(rootp) / f
-                    z.write(abs_path, abs_path.relative_to(tmp_dir))
+            # 1) Detectados
+            for rem, archivo in registros:
+                abs_path = clasificados / archivo
+                arcname = Path("Remitos Clasificados") / archivo
+                if abs_path.exists():
+                    z.write(abs_path, arcname)
+
+            # 2) SIN_REMITO
+            sin_remito = sorted(
+                [f for f in os.listdir(clasificados) if f.startswith("SIN_REMITO_")],
+                key=lambda x: x
+            )
+            for archivo in sin_remito:
+                abs_path = clasificados / archivo
+                arcname = Path("Remitos Clasificados") / archivo
+                if abs_path.exists():
+                    z.write(abs_path, arcname)
 
         st.success("✔ Remitos procesados correctamente")
         with open(zip_path, "rb") as zf:
             st.download_button(
                 "📥 Descargar ZIP",
                 zf,
-                file_name="remitos_clasificados.zip",
+                file_name=zip_name,
                 mime="application/zip",
             )
 
         # Mensajes de cierre
         if stopped_by_rate:
-            st.info("👆 Se detuvo por el límite horario de OCR. "
-                    "Usá “Continuar desde página” para retomar luego donde quedó.")
+            st.info(
+                "👆 Se detuvo por el límite horario de OCR. "
+                "Usá “Continuar desde página” para retomar donde quedó."
+            )
         elif usar_ocr and api_key and (ocr_count >= MAX_OCR):
-            st.info("🔁 Alcanzaste el tope de páginas OCR por esta ejecución. "
-                    "Aumentá MAX_OCR o re-ejecutá con 'Continuar desde página' para seguir.")
+            st.info(
+                "🔁 Alcanzaste el tope de páginas OCR por esta ejecución. "
+                "Aumentá MAX_OCR o re-ejecutá con 'Continuar desde página' para seguir."
+            )
         else:
             st.caption("Listo. Si quedaron páginas SIN_REMITO, reintentá con OCR activado o ajustá el patrón.")
 
